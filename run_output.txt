@@ -1,0 +1,49 @@
+==================================================================================
+INSTATRUST -- dealer-counter approval routing for 7 sample applicants
+==================================================================================
+
+[A-01 (new customer)]
+  Path:      manual_review
+  Wait time: 30 min (was 30 min)
+  Reason:    New applicant: no repayment history with this lender exists yet, so there is nothing to instantly trust. Routed to manual review.
+
+[A-02 (clean repeat customer)]
+  Path:      instant
+  Wait time: 2 min (was 30 min)
+  Reason:    Returning customer with 2 completed loan(s), 0 missed payment(s), and no defaults. Own repayment history already answers the trust question -- instantly approved, manual review skipped.
+
+[A-03 (repeat, one late payment)]
+  Path:      instant
+  Wait time: 2 min (was 30 min)
+  Reason:    Returning customer with 1 completed loan(s), 1 missed payment(s), and no defaults. Own repayment history already answers the trust question -- instantly approved, manual review skipped.
+
+[A-04 (repeat, multiple late payments)]
+  Path:      manual_review
+  Wait time: 30 min (was 30 min)
+  Reason:    Returning customer with a clean default record, but 3 missed payments exceeds the threshold of 1. Routed to manual review.
+
+[A-05 (repeat, prior default)]
+  Path:      manual_review
+  Wait time: 30 min (was 30 min)
+  Reason:    Returning customer, but has 1 prior default(s) with this lender. Trust is not auto-restored after a default. Routed to manual review.
+
+[A-06 (returning, first loan still open)]
+  Path:      manual_review
+  Wait time: 30 min (was 30 min)
+  Reason:    Returning customer, but has not yet completed a full loan cycle with this lender -- insufficient history to trust instantly. Routed to manual review.
+
+[A-07 (clean repeat customer)]
+  Path:      instant
+  Wait time: 2 min (was 30 min)
+  Reason:    Returning customer with 5 completed loan(s), 1 missed payment(s), and no defaults. Own repayment history already answers the trust question -- instantly approved, manual review skipped.
+
+==================================================================================
+SUMMARY
+==================================================================================
+  Applicants:                7
+  Instantly approved:        3 / 7
+  Total wait, uniform 30-min baseline: 210 min
+  Total wait, with InstaTrust:          126 min
+  Minutes of counter wait closed:       84 min (40%)
+
+Note what did NOT get fast-tracked: a customer with a prior default (A-05), one whose only loan is still open (A-06), and one with enough recent missed payments to warrant a second look (A-04) all still go through the unchanged 30-minute manual-review path. This is a fast lane for a specific, already-vetted segment -- not a blanket shortcut.
