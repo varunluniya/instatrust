@@ -1,0 +1,8 @@
+== InstaTrust eval ==
+cases=14 runs/case=3 accuracy=100.0% consistency=100.0%
+  context                      acc=100.0% cons=100.0% n=4
+  dealer                       acc=100.0% cons=100.0% n=1
+  lane                         acc=100.0% cons=100.0% n=1
+  one_way                      acc=100.0% cons=100.0% n=1
+  v1_batch                     acc=100.0% cons=100.0% n=7
+GATE: PASS

@@ -1,0 +1,7 @@
+apps   v1 instant  v1 def  v1 rate  v2 instant  v2 def  v2 rate   D-13 in v2
+200           200      26    13.0%         100       4     4.0%   TRIPPED
+400           400      46    11.5%         183       5     2.7%   TRIPPED
+600           600      59     9.8%         273       7     2.6%   TRIPPED
+
+Wait minutes saved: v1 16,800  v2 7,644 (46% of v1's speed benefit kept)
+Instant-lane defaults: v1 59 (9.8%)  v2 7 (2.6%)

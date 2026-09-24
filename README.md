@@ -1,12 +1,67 @@
 # InstaTrust
 
+_Instant approval at the dealer counter for returning customers whose own repayment record answers the trust question, checked against the loan size, the dealer and the timing. The lane protects itself: it tightens automatically and loosens only with a human._
+
+[![ci](https://github.com/varunluniya/instatrust/actions/workflows/ci.yml/badge.svg)](https://github.com/varunluniya/instatrust/actions/workflows/ci.yml)
+
+## What's new in v2: an intelligent, deployable service
+
+| Layer | In InstaTrust |
+|---|---|
+| **Retrieval** | Instant-lane policy. The clause behind each routing reason is cited |
+| **Context** | Requested amount vs largest completed loan (1.5× step-up), recency (36 months), open loans, dealer status |
+| **Memory** | A per-customer ledger: loans, amounts, repayments, misses, defaults |
+| **Feedback** | Outcomes → ledger → dealer circuit breaker → lane guardrail (auto-tighten only) |
+
+Every v2 check can only move an applicant from instant to manual, never the reverse (verified in the eval gate).
+
+**Proof** (`python simulate_learning.py`, 600 applications, hidden exposure risk and a dealer fraud ring):
+
+| | v1 | v2 |
+|---|---|---|
+| Instant-lane default rate | 9.8% | **2.6%** |
+| Dealer D-13 fraud ring | never noticed | paused automatically within 200 apps |
+| Applicants getting the 28-minute saving | 100% | 46% (the rest are the risky ones) |
+
+Full framework write-up: [FRAMEWORK.md](FRAMEWORK.md).
+
+## Run it
+
+```bash
+pip install -r requirements-dev.txt
+uvicorn app:app --reload        # http://127.0.0.1:8000/docs
+python -m pytest -q             # original 7 tests + service/API tests
+python run_evals.py
+python simulate_learning.py
+```
+
+Docker: `docker build -t instatrust . && docker run -p 8000:8000 -v instatrust-data:/data instatrust` · Render: `render.yaml`.
+
+```bash
+curl -X POST localhost:8000/customers/C1/loans -H 'content-type: application/json' -d '{"loan_id":"L1","amount":25000,"closed_on":"2026-03-01"}'
+curl -X POST localhost:8000/decide -H 'content-type: application/json' -d '{"applicant_id":"C1","requested_amount":60000,"dealer_id":"D-01"}'
+```
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /customers/{id}/loans` · `GET /customers/{id}` | Ledger |
+| `POST /decide` | Instant or manual, v1 path, what blocked it, counter message, trace |
+| `POST /feedback` | Repaid / missed payment / defaulted → ledger + guardrails |
+| `GET /guardrails` · `GET /dealers/{id}` | Lane and dealer circuit breakers |
+
+---
+
+## The original engine (v1)
+
+The v1 demo still runs unchanged; the service wraps it.
+
 Instant loan approval for returning customers at the point of sale —
 built around a simple idea: a lender doesn't need to re-run the same
 30-minute manual underwriting review on someone whose own repayment
 history already answers the only question that review exists to
 answer.
 
-## The problem
+### The problem
 
 At a dealer counter (financing a two-wheeler, a phone, any
 consumer-durable purchase), loan processing takes roughly 30 minutes of
@@ -19,7 +74,7 @@ or they simply walk to a dealer or lender who can move faster. The
 underlying job a fast approval is "hired" to do isn't paperwork
 processing — it's locking in the sale before that window closes.
 
-## What InstaTrust does
+### What InstaTrust does
 
 InstaTrust splits the applicant funnel instead of trying to speed up
 manual review uniformly for everyone:
@@ -36,7 +91,7 @@ This isn't a blanket shortcut; it's a targeted fast lane for exactly
 the segment where the trust question has already been answered by the
 lender's own records.
 
-## Running it
+### Running it
 
 ```bash
 pip install pytest                                     # only needed for the test suite
@@ -53,7 +108,7 @@ minutes (40%) — while a prior default, an over-threshold count of
 missed payments, and a still-open first loan are all correctly kept on
 the unchanged manual-review path.
 
-## Files
+### Files
 
 - `approval_engine.py` — the core routing rule: `decide()` returns a
   structured `ApprovalDecision` (path, processing time, and a
@@ -69,7 +124,7 @@ the unchanged manual-review path.
   missed payment.
 - `run_output.txt` — captured real output from `simulate.py`.
 
-## Design note
+### Design note
 
 This project started as a job-to-be-done analysis: the ordinary framing
 ("loan processing takes 30 minutes") looks like a pure speed problem,
