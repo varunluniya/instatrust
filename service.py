@@ -83,8 +83,8 @@ class InstaTrustService:
         return int(self.memory.get_param("max_missed_payments", MAX_MISSED_PAYMENTS_FOR_TRUST))
 
     def dealer_status(self, dealer_id: str) -> dict:
-        rows = [d for d in self.memory.decisions(system=SYSTEM, with_outcome=True)
-                if d["features"].get("dealer_id") == dealer_id and d["output"]["path"] == "instant"]
+        rows = [d for d in self.memory.decisions(system=SYSTEM, with_outcome=True, feature=("dealer_id", dealer_id))
+                if d["output"]["path"] == "instant"]
         bad = sum(1 for d in rows if d["outcome"]["result"] == "defaulted")
         return fb.Guardrail(f"dealer:{dealer_id}", DEALER_LIMIT, min_n=10).check(bad, len(rows))
 
@@ -158,7 +158,7 @@ class InstaTrustService:
 
     # -- feedback -----------------------------------------------------------------------------------
     def record_outcome(self, decision_id: str, result: str, loan_id: str | None = None,
-                       amount: float | None = None) -> dict:
+                       amount: float | None = None, on: date | None = None) -> dict:
         if result not in ("repaid", "missed_payment", "defaulted"):
             raise ValueError("result must be repaid, missed_payment or defaulted")
         d = self.memory.get_decision(decision_id)
@@ -171,7 +171,7 @@ class InstaTrustService:
         existing = next((l for l in self.ledger(cid)["loans"] if l["loan_id"] == lid), None)
         missed = (existing["missed_payments"] if existing else 0) + (result == "missed_payment")
         status = {"repaid": "completed", "missed_payment": "open", "defaulted": "defaulted"}[result]
-        self.add_loan(cid, lid, amt, status, missed, date.today().isoformat() if status == "completed" else None)
+        self.add_loan(cid, lid, amt, status, missed, (on or date.today()).isoformat() if status == "completed" else None)
         return self.learn()
 
     def learn(self) -> dict:

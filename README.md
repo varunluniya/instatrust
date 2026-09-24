@@ -49,6 +49,17 @@ curl -X POST localhost:8000/decide -H 'content-type: application/json' -d '{"app
 | `POST /feedback` | Repaid / missed payment / defaulted → ledger + guardrails |
 | `GET /guardrails` · `GET /dealers/{id}` | Lane and dealer circuit breakers |
 
+## Demo data
+
+`python seed.py` fills `data/instatrust.db` with synthetic history so every endpoint returns something meaningful on first run: A ledger of 900 customers with prior loans, 1,200 dealer-counter applications across 20 dealers over 12 months, 90-day outcomes, and dealer D-13's synthetic fraud ring already paused by its breaker.
+
+```bash
+python seed.py            # create data/instatrust.db
+python seed.py --reset    # rebuild it from scratch
+```
+
+The Docker image seeds `/data` on first boot (set `GEN4_SEED=0` to start empty). All of it is synthetic: no real customers, patients, tickets or model outputs. `GET /health` shows the dataset's counts.
+
 ---
 
 ## The original engine (v1)
