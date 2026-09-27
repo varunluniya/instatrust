@@ -25,7 +25,7 @@ from approval_engine import (
     INSTANT_APPROVAL_MINUTES, MANUAL_REVIEW_MINUTES, MAX_MISSED_PAYMENTS_FOR_TRUST,
     Applicant, ApprovalPath, LoanHistory, decide,
 )
-from gen4 import Context, KnowledgeBase, LLMClient, Memory, Trace
+from gen4 import Context, KnowledgeBase, LLMClient, Memory, Trace, guardrail_check
 from gen4 import feedback as fb
 
 SYSTEM = "instatrust"
@@ -136,7 +136,7 @@ class InstaTrustService:
         for k in dict.fromkeys(cited):
             passages += self.kb.search(HEADINGS[k], k=1)
         trace.cite({(p.source, p.heading): p for p in passages}.values())
-        msg = self._message(path, reasons)
+        msg = self._message(path, reasons, passages)
         trace.model = {"provider": self.llm.last_provider}
 
         out = {"applicant_id": applicant_id, "path": path.value,
@@ -147,14 +147,39 @@ class InstaTrustService:
                                           "requested_amount": requested_amount}, out)
         return {"decision_id": did, **out, "trace": trace.as_dict()}
 
-    def _message(self, path: ApprovalPath, reasons: list[str]) -> str:
+    def _message(self, path: ApprovalPath, reasons: list[str], passages) -> str:
         def offline():
             if path == ApprovalPath.INSTANT:
                 return "Approved instantly based on your repayment record with us. Thank you for coming back."
             return ("Your application is with our underwriting team; it usually takes about 30 minutes. "
                     "Nothing is needed from you right now.")
-        return self.llm.complete(f"Write one friendly sentence for a dealer-counter customer. Route: {path.value}. "
-                                 f"Do not reveal internal risk reasons: {reasons}", offline=offline, max_tokens=80)
+        draft = self.llm.complete(f"Write one friendly sentence for a dealer-counter customer. Route: {path.value}. "
+                                  f"Do not reveal internal risk reasons: {reasons}", offline=offline, max_tokens=80)
+        return self._guarded(draft, path, offline(), passages)
+
+    def _guarded(self, draft: str, path: ApprovalPath, fallback: str, passages) -> str:
+        """Post-model guardrail (Guide 4 Section 7.3): two distinct ways this
+        customer-facing line can go wrong even though it is grounded in the same
+        policy the routing decision used -- (1) it claims instant approval for a
+        path that was actually routed to manual review, or (2) it leaks the
+        internal risk reasons the prompt explicitly told it to withhold (dealer
+        exposure limits, missed-payment counts, etc. are not the customer's to see
+        at the counter, whatever the drafting model decided to include)."""
+        INTERNAL_TERMS = ("exposure", "dealer", "months_since_last_close", "open_loans",
+                          "missed_payment", "upper_bound", "default", "manual_review", "blocked_by")
+
+        def offline_check(response: str, _passages) -> tuple[bool, str]:
+            low = response.lower()
+            if path != ApprovalPath.INSTANT and "instant" in low and "not instant" not in low:
+                return False, f"draft implies instant approval but the route is {path.value}"
+            leaked = [t for t in INTERNAL_TERMS if t.replace("_", " ") in low or t in low]
+            if leaked:
+                return False, f"draft leaks internal risk terminology {leaked}"
+            return True, ""
+        is_safe, reason = guardrail_check(draft, passages, self.llm, offline=offline_check)
+        if is_safe:
+            return draft
+        return fallback + f" (Note: guardrail replaced a draft that {reason}.)"
 
     # -- feedback -----------------------------------------------------------------------------------
     def record_outcome(self, decision_id: str, result: str, loan_id: str | None = None,
