@@ -25,7 +25,7 @@ from approval_engine import (
     INSTANT_APPROVAL_MINUTES, MANUAL_REVIEW_MINUTES, MAX_MISSED_PAYMENTS_FOR_TRUST,
     Applicant, ApprovalPath, LoanHistory, decide,
 )
-from gen4 import Context, KnowledgeBase, LLMClient, Memory, Trace
+from gen4 import Context, KnowledgeBase, LLMClient, Memory, Trace, guardrail_check
 from gen4 import feedback as fb
 
 SYSTEM = "instatrust"
@@ -83,10 +83,15 @@ class InstaTrustService:
         return int(self.memory.get_param("max_missed_payments", MAX_MISSED_PAYMENTS_FOR_TRUST))
 
     def dealer_status(self, dealer_id: str) -> dict:
-        rows = [d for d in self.memory.decisions(system=SYSTEM, with_outcome=True, feature=("dealer_id", dealer_id))
-                if d["output"]["path"] == "instant"]
-        bad = sum(1 for d in rows if d["outcome"]["result"] == "defaulted")
-        return fb.Guardrail(f"dealer:{dealer_id}", DEALER_LIMIT, min_n=10).check(bad, len(rows))
+        """Incremental-loading fix: this used to re-scan every decision+outcome for this
+        dealer on every call -- called from inside decide() for every
+        instant-lane applicant, so it was the hottest instance of this
+        mistake in the repo. It now reads a running total that learn()
+        maintains incrementally; record_outcome() always calls learn()
+        before the next decide() can run, so this is never stale."""
+        totals = self.memory.get_param(f"accum:{self.LEARN_KEY}:dealer:{dealer_id}", {"rows": 0, "bad": 0})
+        return fb.Guardrail(f"dealer:{dealer_id}", DEALER_LIMIT, min_n=10).check(
+            totals.get("bad", 0), totals.get("rows", 0))
 
     # -- decision ------------------------------------------------------------------------------
     def decide(self, applicant_id: str, requested_amount: float, dealer_id: str = "unknown",
@@ -136,7 +141,7 @@ class InstaTrustService:
         for k in dict.fromkeys(cited):
             passages += self.kb.search(HEADINGS[k], k=1)
         trace.cite({(p.source, p.heading): p for p in passages}.values())
-        msg = self._message(path, reasons)
+        msg = self._message(path, reasons, passages)
         trace.model = {"provider": self.llm.last_provider}
 
         out = {"applicant_id": applicant_id, "path": path.value,
@@ -147,14 +152,39 @@ class InstaTrustService:
                                           "requested_amount": requested_amount}, out)
         return {"decision_id": did, **out, "trace": trace.as_dict()}
 
-    def _message(self, path: ApprovalPath, reasons: list[str]) -> str:
+    def _message(self, path: ApprovalPath, reasons: list[str], passages) -> str:
         def offline():
             if path == ApprovalPath.INSTANT:
                 return "Approved instantly based on your repayment record with us. Thank you for coming back."
             return ("Your application is with our underwriting team; it usually takes about 30 minutes. "
                     "Nothing is needed from you right now.")
-        return self.llm.complete(f"Write one friendly sentence for a dealer-counter customer. Route: {path.value}. "
-                                 f"Do not reveal internal risk reasons: {reasons}", offline=offline, max_tokens=80)
+        draft = self.llm.complete(f"Write one friendly sentence for a dealer-counter customer. Route: {path.value}. "
+                                  f"Do not reveal internal risk reasons: {reasons}", offline=offline, max_tokens=80)
+        return self._guarded(draft, path, offline(), passages)
+
+    def _guarded(self, draft: str, path: ApprovalPath, fallback: str, passages) -> str:
+        """Post-model guardrail: two distinct ways this
+        customer-facing line can go wrong even though it is grounded in the same
+        policy the routing decision used -- (1) it claims instant approval for a
+        path that was actually routed to manual review, or (2) it leaks the
+        internal risk reasons the prompt explicitly told it to withhold (dealer
+        exposure limits, missed-payment counts, etc. are not the customer's to see
+        at the counter, whatever the drafting model decided to include)."""
+        INTERNAL_TERMS = ("exposure", "dealer", "months_since_last_close", "open_loans",
+                          "missed_payment", "upper_bound", "default", "manual_review", "blocked_by")
+
+        def offline_check(response: str, _passages) -> tuple[bool, str]:
+            low = response.lower()
+            if path != ApprovalPath.INSTANT and "instant" in low and "not instant" not in low:
+                return False, f"draft implies instant approval but the route is {path.value}"
+            leaked = [t for t in INTERNAL_TERMS if t.replace("_", " ") in low or t in low]
+            if leaked:
+                return False, f"draft leaks internal risk terminology {leaked}"
+            return True, ""
+        is_safe, reason = guardrail_check(draft, passages, self.llm, offline=offline_check)
+        if is_safe:
+            return draft
+        return fallback + f" (Note: guardrail replaced a draft that {reason}.)"
 
     # -- feedback -----------------------------------------------------------------------------------
     def record_outcome(self, decision_id: str, result: str, loan_id: str | None = None,
@@ -174,15 +204,49 @@ class InstaTrustService:
         self.add_loan(cid, lid, amt, status, missed, (on or date.today()).isoformat() if status == "completed" else None)
         return self.learn()
 
+    LEARN_KEY = "instatrust_learn"
+    LEARN_GRACE_DAYS = 7
+
     def learn(self) -> dict:
-        rows = [d for d in self.memory.decisions(system=SYSTEM, with_outcome=True) if d["output"]["path"] == "instant"]
-        bad = sum(1 for d in rows if d["outcome"]["result"] == "defaulted")
-        lane = fb.Guardrail("instant_lane_default_rate", LANE_LIMIT, min_n=30).check(bad, len(rows))
+        """Incremental-loading fix: used to re-pull and re-aggregate every instant-lane
+        decision+outcome the system had ever logged, on every call (the classic full-rescan mistake). Now pulls only outcomes that arrived since the
+        last watermark (with a grace window for late-arriving outcomes),
+        and merges their deltas into running totals -- both the lane-wide
+        total and a per-dealer total that dealer_status() now reads from
+        instead of re-scanning."""
+        new = fb.new_rows_since(self.memory, SYSTEM, self.LEARN_KEY, grace_days=self.LEARN_GRACE_DAYS)
+        new_instant = [d for d in new if d["output"]["path"] == "instant"]
+        new_bad = sum(1 for d in new_instant if d["outcome"]["result"] == "defaulted")
+        totals = fb.accumulate(self.memory, self.LEARN_KEY, rows=len(new_instant), bad=new_bad)
+        lane = fb.Guardrail("instant_lane_default_rate", LANE_LIMIT, min_n=30).check(
+            totals.get("bad", 0), totals.get("rows", 0))
         action = None
         if lane["tripped"] and self.max_missed() > 0:
             self.memory.set_param("max_missed_payments", 0, "lane guardrail tripped: auto-tighten (safe direction)")
             action = "instant lane tightened: missed payments allowed 1 -> 0"
-        dealers = sorted({d["features"].get("dealer_id") for d in rows})
         self.memory.add_fact("lane:instant", "guardrail", lane)
+
+        dealer_deltas: dict[str, dict] = {}
+        for d in new_instant:
+            dealer_id = d["features"].get("dealer_id")
+            if not dealer_id:
+                continue
+            bucket = dealer_deltas.setdefault(dealer_id, {"rows": 0, "bad": 0})
+            bucket["rows"] += 1
+            bucket["bad"] += int(d["outcome"]["result"] == "defaulted")
+        for dealer_id, delta in dealer_deltas.items():
+            fb.accumulate(self.memory, f"{self.LEARN_KEY}:dealer:{dealer_id}", rows=delta["rows"], bad=delta["bad"])
+        fb.mark_processed(self.memory, self.LEARN_KEY, new)
+
+        # The returned snapshot must cover every dealer ever seen in the
+        # instant lane, not just the ones in this batch -- callers (e.g.
+        # seed.py) call learn() once at the end expecting a full picture.
+        # Track the dealer set itself incrementally too, rather than
+        # re-deriving it by re-scanning every decision.
+        known_key = f"{self.LEARN_KEY}:known_dealers"
+        known = set(self.memory.get_param(known_key, []))
+        if dealer_deltas and not dealer_deltas.keys() <= known:
+            known |= set(dealer_deltas)
+            self.memory.set_param(known_key, sorted(known), reason="incremental learn(): track dealer set")
         return {"lane": lane, "action": action,
-                "dealers": {k: self.dealer_status(k)["status"] for k in dealers}}
+                "dealers": {k: self.dealer_status(k)["status"] for k in sorted(known)}}
